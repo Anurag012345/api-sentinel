@@ -1,114 +1,160 @@
-const axios = require('axios');
 const pool = require('../config/db');
-const { calculateCost } = require('../config/pricing');
+const { getProvider } = require('./providers');
 const { decrypt } = require('../utils/encryption');
+const { setSyncError } = require('./budgetEngine');
 const logger = require('../utils/logger');
 
-const OPENAI_USAGE_URL = 'https://api.openai.com/v1/usage';
 const MAX_RETRIES = 3;
 
 /**
- * Fetch usage from OpenAI for a given date.
- * @param {string} apiKey - Plaintext OpenAI API key
- * @param {string} date - Date in YYYY-MM-DD format
- * @returns {object} { totalCost, breakdown }
- */
-async function fetchOpenAIUsage(apiKey, date) {
-    // OpenAI usage endpoint expects start_date parameter
-    const response = await axios.get(OPENAI_USAGE_URL, {
-        headers: {
-            Authorization: `Bearer ${apiKey}`,
-        },
-        params: {
-            date,
-        },
-    });
-
-    const data = response.data;
-    let totalCost = 0;
-    const breakdown = [];
-
-    // Parse usage data from OpenAI response
-    if (data && data.data) {
-        for (const entry of data.data) {
-            const model = entry.snapshot_id || entry.model || 'unknown';
-            const inputTokens = entry.n_context_tokens_total || entry.n_prompt_tokens_total || 0;
-            const outputTokens = entry.n_generated_tokens_total || entry.n_completion_tokens_total || 0;
-            const cost = calculateCost(model, inputTokens, outputTokens);
-            totalCost += cost;
-            breakdown.push({ model, inputTokens, outputTokens, cost });
-        }
-    }
-
-    return { totalCost, breakdown };
-}
-
-/**
- * Check usage for a specific user.
+ * Check usage for a specific provider.
  * - Decrypts API key
- * - Calls OpenAI usage API (with retry)
- * - Stores usage log in database
- * @param {string} userId - User UUID
- * @param {string} encryptedApiKey - Encrypted API key from DB
- * @returns {number} totalCost for today
+ * - Calls provider usage API (with retry + exponential backoff)
+ * - Stores usage records in database (15-min buckets)
+ * - Updates daily totals
+ *
+ * @param {object} providerRecord - Provider record from DB
+ * @returns {Promise<{totalCost: number, totalTokens: number, inputTokens: number, outputTokens: number}>}
  */
-async function checkUsage(userId, encryptedApiKey) {
-    // Decrypt the API key
-    const apiKey = decrypt(encryptedApiKey);
+async function checkUsage(providerRecord) {
+    const { id: providerId, provider_name, encrypted_api_key, current_state } = providerRecord;
 
-    const today = new Date().toISOString().split('T')[0]; // YYYY-MM-DD
+    // Decrypt the API key
+    const apiKey = decrypt(encrypted_api_key);
+    const provider = getProvider(provider_name);
+    const today = new Date().toISOString().split('T')[0];
     let lastError;
 
     // Retry up to MAX_RETRIES times
     for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
         try {
-            const { totalCost, breakdown } = await fetchOpenAIUsage(apiKey, today);
+            const usage = await provider.fetchUsage(apiKey, today);
 
-            // Upsert usage log for today
+            // Current timestamp for bucket
+            const now = new Date();
+            const bucketTime = getBucketTime(now);
+
+            // Upsert usage record for current bucket
             await pool.query(
-                `INSERT INTO usage_logs (user_id, date, total_cost, checked_at)
-         VALUES ($1, $2, $3, NOW())
-         ON CONFLICT (user_id, date)
-         DO UPDATE SET total_cost = $3, checked_at = NOW()`,
-                [userId, today, totalCost]
+                `INSERT INTO usage_records (provider_id, date, bucket_time, input_tokens, output_tokens, total_tokens, cost)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7)
+                 ON CONFLICT DO NOTHING`,
+                [providerId, today, bucketTime, usage.inputTokens, usage.outputTokens, usage.totalTokens, usage.totalCost]
             );
 
-            logger.info('Usage check completed', { userId, totalCost, date: today });
-            return totalCost;
+            // Upsert daily totals
+            await pool.query(
+                `INSERT INTO daily_totals (provider_id, date, total_cost, total_tokens, input_tokens, output_tokens, last_updated)
+                 VALUES ($1, $2, $3, $4, $5, $6, NOW())
+                 ON CONFLICT (provider_id, date)
+                 DO UPDATE SET total_cost = $3, total_tokens = $4, input_tokens = $5, output_tokens = $6, last_updated = NOW()`,
+                [providerId, today, usage.totalCost, usage.totalTokens, usage.inputTokens, usage.outputTokens]
+            );
+
+            // Update sync status
+            await pool.query(
+                "UPDATE providers SET last_synced_at = NOW(), sync_status = 'OK' WHERE id = $1",
+                [providerId]
+            );
+
+            // If provider was in SYNC_ERROR, clear it back to NORMAL for re-evaluation
+            if (current_state === 'SYNC_ERROR') {
+                const { transitionState } = require('./budgetEngine');
+                await transitionState(providerId, 'SYNC_ERROR', 'NORMAL', 'Sync recovered');
+            }
+
+            logger.info('Usage check completed', {
+                providerId,
+                provider: provider_name,
+                totalCost: usage.totalCost,
+                totalTokens: usage.totalTokens,
+                date: today,
+            });
+
+            return usage;
         } catch (err) {
             lastError = err;
             logger.warn(`Usage fetch attempt ${attempt}/${MAX_RETRIES} failed`, {
-                userId,
+                providerId,
+                provider: provider_name,
                 error: err.message,
             });
 
             if (attempt < MAX_RETRIES) {
-                // Wait before retrying (exponential backoff)
                 await new Promise(resolve => setTimeout(resolve, 1000 * attempt));
             }
         }
     }
 
-    // All retries exhausted
+    // All retries exhausted — mark as SYNC_ERROR
     logger.error('Usage fetch failed after all retries', {
-        userId,
+        providerId,
+        provider: provider_name,
         error: lastError?.message,
     });
+
+    await setSyncError(providerId, current_state, lastError?.message || 'Unknown error');
     throw lastError;
 }
 
 /**
- * Get today's total cost for a user from the database.
- * @param {string} userId
- * @returns {number}
+ * Get today's totals for a provider from the database.
+ * @param {string} providerId
+ * @returns {Promise<{totalCost: number, totalTokens: number, inputTokens: number, outputTokens: number}>}
  */
-async function getTodayCost(userId) {
+async function getTodayTotals(providerId) {
     const today = new Date().toISOString().split('T')[0];
     const result = await pool.query(
-        'SELECT total_cost FROM usage_logs WHERE user_id = $1 AND date = $2 ORDER BY checked_at DESC LIMIT 1',
-        [userId, today]
+        'SELECT total_cost, total_tokens, input_tokens, output_tokens FROM daily_totals WHERE provider_id = $1 AND date = $2',
+        [providerId, today]
     );
-    return result.rows.length > 0 ? parseFloat(result.rows[0].total_cost) : 0;
+
+    if (result.rows.length > 0) {
+        const row = result.rows[0];
+        return {
+            totalCost: parseFloat(row.total_cost) || 0,
+            totalTokens: parseInt(row.total_tokens) || 0,
+            inputTokens: parseInt(row.input_tokens) || 0,
+            outputTokens: parseInt(row.output_tokens) || 0,
+        };
+    }
+
+    return { totalCost: 0, totalTokens: 0, inputTokens: 0, outputTokens: 0 };
 }
 
-module.exports = { checkUsage, getTodayCost };
+/**
+ * Get 24-hour usage data in 15-min buckets for a provider.
+ * @param {string} providerId
+ * @returns {Promise<Array>}
+ */
+async function get24HourUsage(providerId) {
+    const result = await pool.query(
+        `SELECT bucket_time, cost, total_tokens, input_tokens, output_tokens
+         FROM usage_records
+         WHERE provider_id = $1 AND bucket_time >= NOW() - INTERVAL '24 hours'
+         ORDER BY bucket_time ASC`,
+        [providerId]
+    );
+
+    return result.rows.map(row => ({
+        time: row.bucket_time,
+        cost: parseFloat(row.cost) || 0,
+        totalTokens: parseInt(row.total_tokens) || 0,
+        inputTokens: parseInt(row.input_tokens) || 0,
+        outputTokens: parseInt(row.output_tokens) || 0,
+    }));
+}
+
+/**
+ * Get the 15-minute bucket time for a given date.
+ * Rounds down to the nearest 15-minute interval.
+ * @param {Date} date
+ * @returns {Date}
+ */
+function getBucketTime(date) {
+    const bucket = new Date(date);
+    bucket.setMinutes(Math.floor(bucket.getMinutes() / 15) * 15, 0, 0);
+    return bucket;
+}
+
+module.exports = { checkUsage, getTodayTotals, get24HourUsage, getBucketTime };

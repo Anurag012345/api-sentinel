@@ -1,25 +1,12 @@
 -- ============================================================
--- API Sentinel — Database Initialization Script (v2)
--- Run this against your Supabase / Postgres instance.
--- Supports multi-provider (OpenAI + Claude) with state machine.
+-- API Sentinel — V2 Migration Script
+-- Purpose: Upgrades existing V1 database to V2 multi-provider schema without data loss.
+-- Run this script in your Supabase SQL Editor.
 -- ============================================================
 
--- Enable UUID generation
-CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+-- 1. Create new tables if they don't exist yet
+--    (Safe to run even if tables exist)
 
--- ============================================================
--- 1. Users table
--- ============================================================
-CREATE TABLE IF NOT EXISTS users (
-  id            UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-  email         TEXT UNIQUE NOT NULL,
-  password_hash TEXT NOT NULL,
-  created_at    TIMESTAMP WITH TIME ZONE DEFAULT NOW()
-);
-
--- ============================================================
--- 2. Providers table (per-user, per-provider config + state)
--- ============================================================
 CREATE TABLE IF NOT EXISTS providers (
   id                 UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
   user_id            UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -37,9 +24,6 @@ CREATE TABLE IF NOT EXISTS providers (
   UNIQUE(user_id, provider_name)
 );
 
--- ============================================================
--- 3. Usage Records table (15-min bucketed usage data)
--- ============================================================
 CREATE TABLE IF NOT EXISTS usage_records (
   id            UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
   provider_id   UUID NOT NULL REFERENCES providers(id) ON DELETE CASCADE,
@@ -52,9 +36,6 @@ CREATE TABLE IF NOT EXISTS usage_records (
   created_at    TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
--- ============================================================
--- 4. Daily Totals table (aggregated daily snapshot per provider)
--- ============================================================
 CREATE TABLE IF NOT EXISTS daily_totals (
   id             UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
   provider_id    UUID NOT NULL REFERENCES providers(id) ON DELETE CASCADE,
@@ -67,9 +48,6 @@ CREATE TABLE IF NOT EXISTS daily_totals (
   UNIQUE(provider_id, date)
 );
 
--- ============================================================
--- 5. Alerts table
--- ============================================================
 CREATE TABLE IF NOT EXISTS alerts (
   id           UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
   user_id      UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -79,9 +57,6 @@ CREATE TABLE IF NOT EXISTS alerts (
   triggered_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
--- ============================================================
--- 6. State Change Logs (audit trail for state machine)
--- ============================================================
 CREATE TABLE IF NOT EXISTS state_change_logs (
   id           UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
   provider_id  UUID NOT NULL REFERENCES providers(id) ON DELETE CASCADE,
@@ -92,9 +67,7 @@ CREATE TABLE IF NOT EXISTS state_change_logs (
   changed_at   TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
--- ============================================================
--- 7. Indexes for performance
--- ============================================================
+-- 2. Indexes
 CREATE INDEX IF NOT EXISTS idx_providers_user ON providers(user_id);
 CREATE INDEX IF NOT EXISTS idx_providers_state ON providers(current_state);
 CREATE INDEX IF NOT EXISTS idx_usage_records_provider_date ON usage_records(provider_id, date);
@@ -103,34 +76,67 @@ CREATE INDEX IF NOT EXISTS idx_daily_totals_provider_date ON daily_totals(provid
 CREATE INDEX IF NOT EXISTS idx_alerts_user_triggered ON alerts(user_id, triggered_at);
 CREATE INDEX IF NOT EXISTS idx_state_change_logs_provider ON state_change_logs(provider_id, changed_at);
 
--- ============================================================
--- 8. Row-Level Security (RLS) — Enable on Supabase
--- ============================================================
-ALTER TABLE users ENABLE ROW LEVEL SECURITY;
+-- 3. RLS Policies (Enable for new tables)
 ALTER TABLE providers ENABLE ROW LEVEL SECURITY;
 ALTER TABLE usage_records ENABLE ROW LEVEL SECURITY;
 ALTER TABLE daily_totals ENABLE ROW LEVEL SECURITY;
 ALTER TABLE alerts ENABLE ROW LEVEL SECURITY;
 ALTER TABLE state_change_logs ENABLE ROW LEVEL SECURITY;
 
--- Policies: users can only access their own rows
--- (These use Supabase auth.uid(); adjust if using a different auth system.)
--- For backend service calls, use the service_role key which bypasses RLS.
+DO $$ 
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE tablename = 'providers' AND policyname = 'providers_self_access') THEN
+        CREATE POLICY providers_self_access ON providers FOR ALL USING (user_id = auth.uid());
+    END IF;
+    
+    IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE tablename = 'usage_records' AND policyname = 'usage_records_self_access') THEN
+        CREATE POLICY usage_records_self_access ON usage_records FOR ALL USING (provider_id IN (SELECT id FROM providers WHERE user_id = auth.uid()));
+    END IF;
 
-CREATE POLICY users_self_access ON users
-  FOR ALL USING (id = auth.uid());
+    IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE tablename = 'daily_totals' AND policyname = 'daily_totals_self_access') THEN
+        CREATE POLICY daily_totals_self_access ON daily_totals FOR ALL USING (provider_id IN (SELECT id FROM providers WHERE user_id = auth.uid()));
+    END IF;
 
-CREATE POLICY providers_self_access ON providers
-  FOR ALL USING (user_id = auth.uid());
+    IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE tablename = 'alerts' AND policyname = 'alerts_self_access') THEN
+        CREATE POLICY alerts_self_access ON alerts FOR ALL USING (user_id = auth.uid());
+    END IF;
 
-CREATE POLICY usage_records_self_access ON usage_records
-  FOR ALL USING (provider_id IN (SELECT id FROM providers WHERE user_id = auth.uid()));
+    IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE tablename = 'state_change_logs' AND policyname = 'state_change_logs_self_access') THEN
+        CREATE POLICY state_change_logs_self_access ON state_change_logs FOR ALL USING (provider_id IN (SELECT id FROM providers WHERE user_id = auth.uid()));
+    END IF;
+END $$;
 
-CREATE POLICY daily_totals_self_access ON daily_totals
-  FOR ALL USING (provider_id IN (SELECT id FROM providers WHERE user_id = auth.uid()));
+-- 4. MIGRATE DATA: Existing Users -> Providers Table (OpenAI)
+INSERT INTO providers (user_id, provider_name, encrypted_api_key, daily_limit, current_state, is_key_valid)
+SELECT 
+  id, 
+  'OPENAI', 
+  encrypted_api_key, 
+  daily_limit,
+  CASE status 
+    WHEN 'active' THEN 'NORMAL' 
+    WHEN 'paused' THEN 'BLOCKED' 
+    ELSE 'NORMAL' 
+  END,
+  CASE WHEN encrypted_api_key IS NOT NULL THEN TRUE ELSE FALSE END
+FROM users
+WHERE encrypted_api_key IS NOT NULL
+ON CONFLICT (user_id, provider_name) DO NOTHING;
 
-CREATE POLICY alerts_self_access ON alerts
-  FOR ALL USING (user_id = auth.uid());
+-- 5. MIGRATE DATA: Old Usage Logs -> Daily Totals
+INSERT INTO daily_totals (provider_id, date, total_cost, last_updated)
+SELECT 
+  p.id,
+  ul.date,
+  ul.total_cost,
+  ul.checked_at
+FROM usage_logs ul
+JOIN providers p ON p.user_id = ul.user_id AND p.provider_name = 'OPENAI'
+ON CONFLICT (provider_id, date) DO NOTHING;
 
-CREATE POLICY state_change_logs_self_access ON state_change_logs
-  FOR ALL USING (provider_id IN (SELECT id FROM providers WHERE user_id = auth.uid()));
+
+-- 6. CLEANUP (Optional - Uncomment to remove old columns/tables after verifying verify migration)
+-- ALTER TABLE users DROP COLUMN IF EXISTS encrypted_api_key;
+-- ALTER TABLE users DROP COLUMN IF EXISTS daily_limit;
+-- ALTER TABLE users DROP COLUMN IF EXISTS status;
+-- DROP TABLE IF EXISTS usage_logs;

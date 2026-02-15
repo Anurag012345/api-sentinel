@@ -1,52 +1,124 @@
 const cron = require('node-cron');
 const pool = require('../config/db');
-const { checkUsage } = require('./usageService');
+const { checkUsage, getTodayTotals } = require('./usageService');
 const budgetEngine = require('./budgetEngine');
 const logger = require('../utils/logger');
 
+// In-memory lock to prevent concurrent processing of same provider
+const processingLocks = new Set();
+
 /**
  * Start the background scheduler.
- * Runs every 15 minutes, checks usage for all active users.
+ * - Usage check: Every 15 minutes
+ * - Daily reset: Midnight UTC
  */
 function start() {
-    logger.info('Scheduler started — running every 15 minutes');
+    logger.info('Scheduler started — usage checks every 15 min, daily reset at midnight UTC');
 
-    // Run every 15 minutes
+    // ============================================================
+    // Usage Check Cron — Every 15 minutes
+    // ============================================================
     cron.schedule('*/15 * * * *', async () => {
-        logger.info('Cron cycle started');
+        logger.info('Usage check cron cycle started');
         const startTime = Date.now();
 
         try {
-            // Fetch all active users with an API key configured
+            // Fetch all providers with valid API keys
             const result = await pool.query(
-                "SELECT id, email, encrypted_api_key, daily_limit, status FROM users WHERE status = 'active' AND encrypted_api_key IS NOT NULL"
+                `SELECT p.id, p.user_id, p.provider_name, p.encrypted_api_key, 
+                        p.limit_type, p.daily_limit, p.warning_percentage, 
+                        p.current_state, p.sync_status,
+                        u.email
+                 FROM providers p
+                 JOIN users u ON u.id = p.user_id
+                 WHERE p.encrypted_api_key IS NOT NULL 
+                   AND p.is_key_valid = TRUE
+                   AND p.current_state != 'BLOCKED'`
             );
 
-            const users = result.rows;
-            logger.info(`Processing ${users.length} active user(s)`);
+            const providers = result.rows;
+            logger.info(`Processing ${providers.length} active provider(s)`);
 
-            // Process each user sequentially
-            for (const user of users) {
+            // Process each provider
+            for (const provider of providers) {
+                const lockKey = `${provider.user_id}:${provider.id}`;
+
+                // Skip if already being processed (idempotent guard)
+                if (processingLocks.has(lockKey)) {
+                    logger.warn('Skipping — already processing', { lockKey });
+                    continue;
+                }
+
+                processingLocks.add(lockKey);
+
                 try {
-                    // 1. Check usage
-                    const currentCost = await checkUsage(user.id, user.encrypted_api_key);
+                    // 1. Check usage from provider API
+                    await checkUsage(provider);
 
-                    // 2. Enforce budget
-                    await budgetEngine.enforce(user, currentCost);
+                    // 2. Get today's totals for enforcement
+                    const totals = await getTodayTotals(provider.id);
+
+                    // 3. Enforce budget limits (state machine)
+                    await budgetEngine.enforce(
+                        provider,
+                        totals.totalCost,
+                        totals.totalTokens,
+                        provider.email
+                    );
                 } catch (err) {
-                    // Log error and continue to next user
-                    logger.error('Error processing user in cron cycle', {
-                        userId: user.id,
+                    // Error already logged in checkUsage / budgetEngine
+                    logger.error('Error processing provider in cron cycle', {
+                        providerId: provider.id,
+                        provider: provider.provider_name,
+                        userId: provider.user_id,
+                        error: err.message,
+                    });
+                } finally {
+                    processingLocks.delete(lockKey);
+                }
+            }
+
+            const elapsed = ((Date.now() - startTime) / 1000).toFixed(2);
+            logger.info(`Usage check cron completed in ${elapsed}s for ${providers.length} provider(s)`);
+        } catch (err) {
+            logger.error('Usage check cron cycle failed', { error: err.message });
+        }
+    });
+
+    // ============================================================
+    // Daily Reset Cron — Midnight UTC
+    // ============================================================
+    cron.schedule('0 0 * * *', async () => {
+        logger.info('Daily reset cron started');
+        const startTime = Date.now();
+
+        try {
+            // Get all providers
+            const result = await pool.query(
+                'SELECT id, current_state FROM providers WHERE encrypted_api_key IS NOT NULL'
+            );
+
+            const providers = result.rows;
+            logger.info(`Resetting ${providers.length} provider(s)`);
+
+            for (const provider of providers) {
+                try {
+                    await budgetEngine.resetDaily(provider.id, provider.current_state);
+                } catch (err) {
+                    logger.error('Error resetting provider', {
+                        providerId: provider.id,
                         error: err.message,
                     });
                 }
             }
 
             const elapsed = ((Date.now() - startTime) / 1000).toFixed(2);
-            logger.info(`Cron cycle completed in ${elapsed}s for ${users.length} user(s)`);
+            logger.info(`Daily reset completed in ${elapsed}s for ${providers.length} provider(s)`);
         } catch (err) {
-            logger.error('Cron cycle failed', { error: err.message });
+            logger.error('Daily reset cron failed', { error: err.message });
         }
+    }, {
+        timezone: 'UTC',
     });
 }
 

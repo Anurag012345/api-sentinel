@@ -1,19 +1,22 @@
 const express = require('express');
-const { saveApiKey, setBudget, reactivate } = require('../controllers/userController');
-const authMiddleware = require('../middlewares/authMiddleware');
-
 const router = express.Router();
+const auth = require('../middlewares/authMiddleware');
+const {
+    saveProviderKey,
+    setProviderBudget,
+    getProviders,
+    deleteProvider,
+    reactivateProvider,
+} = require('../controllers/userController');
 
-// All user routes require authentication
-router.use(authMiddleware);
+// All routes require authentication
+router.use(auth);
 
-// POST /user/api-key
-router.post('/api-key', saveApiKey);
-
-// POST /user/budget
-router.post('/budget', setBudget);
-
-// POST /user/reactivate
-router.post('/reactivate', reactivate);
+// Provider management
+router.get('/providers', getProviders);
+router.post('/provider', saveProviderKey);
+router.post('/provider/budget', setProviderBudget);
+router.delete('/provider/:id', deleteProvider);
+router.post('/reactivate', reactivateProvider);
 
 module.exports = router;

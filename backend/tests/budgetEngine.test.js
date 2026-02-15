@@ -1,5 +1,5 @@
 /**
- * Unit tests for the budget enforcement engine.
+ * Unit tests for the budget enforcement engine (v2 — multi-provider state machine).
  */
 
 // Mock dependencies
@@ -8,58 +8,107 @@ jest.mock('../src/services/notificationService');
 
 const pool = require('../src/config/db');
 const notificationService = require('../src/services/notificationService');
-const { enforce } = require('../src/services/budgetEngine');
+const { enforce, evaluateState, resetDaily, STATES } = require('../src/services/budgetEngine');
 
-describe('Budget Enforcement Engine', () => {
+describe('Budget Engine — evaluateState', () => {
+    const provider = {
+        limit_type: 'DOLLAR',
+        daily_limit: 10.00,
+        warning_percentage: 80,
+    };
+
+    test('should return NORMAL when cost is below warning threshold', () => {
+        expect(evaluateState(provider, 5.00)).toBe(STATES.NORMAL);
+    });
+
+    test('should return WARNING when cost reaches warning threshold', () => {
+        expect(evaluateState(provider, 8.00)).toBe(STATES.WARNING);
+    });
+
+    test('should return BLOCKED when cost reaches limit', () => {
+        expect(evaluateState(provider, 10.00)).toBe(STATES.BLOCKED);
+    });
+
+    test('should return BLOCKED when cost exceeds limit', () => {
+        expect(evaluateState(provider, 15.00)).toBe(STATES.BLOCKED);
+    });
+
+    test('should return NORMAL when no daily limit is set', () => {
+        expect(evaluateState({ ...provider, daily_limit: 0 }, 10.00)).toBe(STATES.NORMAL);
+    });
+
+    test('should use token metric when limit_type is TOKEN', () => {
+        const tokenProvider = { ...provider, limit_type: 'TOKEN', daily_limit: 100000, warning_percentage: 80 };
+        expect(evaluateState(tokenProvider, 0, 50000)).toBe(STATES.NORMAL);
+        expect(evaluateState(tokenProvider, 0, 80000)).toBe(STATES.WARNING);
+        expect(evaluateState(tokenProvider, 0, 100000)).toBe(STATES.BLOCKED);
+    });
+});
+
+describe('Budget Engine — enforce', () => {
     beforeEach(() => {
         jest.clearAllMocks();
     });
 
-    const activeUser = {
-        id: 'user-123',
-        email: 'test@example.com',
+    const activeProvider = {
+        id: 'provider-123',
+        user_id: 'user-123',
+        provider_name: 'OPENAI',
         daily_limit: 5.00,
-        status: 'active',
+        limit_type: 'DOLLAR',
+        warning_percentage: 80,
+        current_state: 'NORMAL',
     };
 
-    test('should skip enforcement if user is already paused', async () => {
-        const pausedUser = { ...activeUser, status: 'paused' };
-        await enforce(pausedUser, 10.00);
-
-        // Should not query database or send notifications
+    test('should not enforce when no daily limit is set', async () => {
+        const noLimitProvider = { ...activeProvider, daily_limit: 0 };
+        await enforce(noLimitProvider, 10.00, 0, 'test@example.com');
         expect(pool.query).not.toHaveBeenCalled();
-        expect(notificationService.sendBudgetExceededEmail).not.toHaveBeenCalled();
     });
 
-    test('should not pause user if cost is below limit', async () => {
-        await enforce(activeUser, 3.00);
-
-        // Should not update user or create alert
+    test('should not change state if cost is below warning threshold', async () => {
+        await enforce(activeProvider, 2.00, 0, 'test@example.com');
+        // evaluateState returns NORMAL, same as current_state — no transition
         expect(pool.query).not.toHaveBeenCalled();
-        expect(notificationService.sendBudgetExceededEmail).not.toHaveBeenCalled();
     });
 
-    test('should pause user and alert when cost exceeds limit', async () => {
-        // Mock: no existing alert for today
+    test('should transition to WARNING when cost reaches warning threshold', async () => {
         pool.query
-            .mockResolvedValueOnce({}) // UPDATE users SET status
+            .mockResolvedValueOnce({}) // UPDATE providers SET current_state
+            .mockResolvedValueOnce({}) // INSERT INTO state_change_logs
+            .mockResolvedValueOnce({ rows: [] }) // SELECT alerts (none exist)
+            .mockResolvedValueOnce({}); // INSERT alert
+
+        await enforce(activeProvider, 4.50, 0, 'test@example.com');
+
+        // Should update provider state
+        expect(pool.query).toHaveBeenCalledWith(
+            'UPDATE providers SET current_state = $1 WHERE id = $2',
+            ['WARNING', 'provider-123']
+        );
+
+        // Should log state change
+        expect(pool.query).toHaveBeenCalledWith(
+            expect.stringContaining('INSERT INTO state_change_logs'),
+            expect.arrayContaining(['provider-123', 'NORMAL', 'WARNING'])
+        );
+    });
+
+    test('should transition to BLOCKED and send email when cost exceeds limit', async () => {
+        pool.query
+            .mockResolvedValueOnce({}) // UPDATE providers SET current_state
+            .mockResolvedValueOnce({}) // INSERT INTO state_change_logs
             .mockResolvedValueOnce({ rows: [] }) // SELECT alerts (none exist)
             .mockResolvedValueOnce({}); // INSERT alert
 
         notificationService.sendBudgetExceededEmail.mockResolvedValue();
 
-        await enforce(activeUser, 6.00);
+        await enforce(activeProvider, 6.00, 0, 'test@example.com');
 
-        // Should update user status
+        // Should update provider state to BLOCKED
         expect(pool.query).toHaveBeenCalledWith(
-            "UPDATE users SET status = 'paused' WHERE id = $1",
-            ['user-123']
-        );
-
-        // Should create alert
-        expect(pool.query).toHaveBeenCalledWith(
-            "INSERT INTO alerts (user_id, type) VALUES ($1, 'budget_exceeded')",
-            ['user-123']
+            'UPDATE providers SET current_state = $1 WHERE id = $2',
+            ['BLOCKED', 'provider-123']
         );
 
         // Should send email
@@ -68,71 +117,74 @@ describe('Budget Enforcement Engine', () => {
             expect.objectContaining({
                 currentCost: 6.00,
                 dailyLimit: 5.00,
+                providerName: 'OPENAI',
             })
         );
     });
 
-    test('should pause user when cost exactly equals limit', async () => {
-        pool.query
-            .mockResolvedValueOnce({})
-            .mockResolvedValueOnce({ rows: [] })
-            .mockResolvedValueOnce({});
-
-        notificationService.sendBudgetExceededEmail.mockResolvedValue();
-
-        await enforce(activeUser, 5.00);
-
-        expect(pool.query).toHaveBeenCalledWith(
-            "UPDATE users SET status = 'paused' WHERE id = $1",
-            ['user-123']
-        );
+    test('should skip if already blocked', async () => {
+        const blockedProvider = { ...activeProvider, current_state: 'BLOCKED' };
+        await enforce(blockedProvider, 10.00, 0, 'test@example.com');
+        expect(pool.query).not.toHaveBeenCalled();
     });
 
     test('should not duplicate alert if one already exists today', async () => {
         pool.query
-            .mockResolvedValueOnce({}) // UPDATE users SET status
+            .mockResolvedValueOnce({}) // UPDATE providers
+            .mockResolvedValueOnce({}) // INSERT INTO state_change_logs
             .mockResolvedValueOnce({ rows: [{ id: 'alert-1' }] }); // SELECT alerts (exists)
 
-        await enforce(activeUser, 10.00);
+        await enforce(activeProvider, 10.00, 0, 'test@example.com');
 
-        // Should pause user
-        expect(pool.query).toHaveBeenCalledWith(
-            "UPDATE users SET status = 'paused' WHERE id = $1",
-            ['user-123']
-        );
-
-        // Should NOT insert another alert
-        expect(pool.query).not.toHaveBeenCalledWith(
-            expect.stringContaining('INSERT INTO alerts'),
-            expect.anything()
-        );
-
-        // Should NOT send email (since alert already exists)
+        // Should NOT send email
         expect(notificationService.sendBudgetExceededEmail).not.toHaveBeenCalled();
     });
 
-    test('should skip enforcement if no daily limit is set', async () => {
-        const noLimitUser = { ...activeUser, daily_limit: 0 };
-        await enforce(noLimitUser, 10.00);
-
-        expect(pool.query).not.toHaveBeenCalled();
-    });
-
-    test('should still pause even if email fails', async () => {
+    test('should still block even if email fails', async () => {
         pool.query
-            .mockResolvedValueOnce({})
-            .mockResolvedValueOnce({ rows: [] })
-            .mockResolvedValueOnce({});
+            .mockResolvedValueOnce({}) // UPDATE providers
+            .mockResolvedValueOnce({}) // INSERT INTO state_change_logs
+            .mockResolvedValueOnce({ rows: [] }) // SELECT alerts
+            .mockResolvedValueOnce({}); // INSERT alert
 
         notificationService.sendBudgetExceededEmail.mockRejectedValue(new Error('Email failed'));
 
-        // Should not throw — email failure is caught
-        await expect(enforce(activeUser, 10.00)).resolves.not.toThrow();
+        await expect(enforce(activeProvider, 10.00, 0, 'test@example.com')).resolves.not.toThrow();
 
-        // Should still have paused the user
         expect(pool.query).toHaveBeenCalledWith(
-            "UPDATE users SET status = 'paused' WHERE id = $1",
-            ['user-123']
+            'UPDATE providers SET current_state = $1 WHERE id = $2',
+            ['BLOCKED', 'provider-123']
+        );
+    });
+});
+
+describe('Budget Engine — resetDaily', () => {
+    beforeEach(() => {
+        jest.clearAllMocks();
+    });
+
+    test('should transition BLOCKED providers to NORMAL', async () => {
+        pool.query
+            .mockResolvedValueOnce({}) // UPDATE providers SET current_state
+            .mockResolvedValueOnce({}) // INSERT INTO state_change_logs
+            .mockResolvedValueOnce({}); // UPDATE providers SET last_reset_at
+
+        await resetDaily('provider-123', 'BLOCKED');
+
+        expect(pool.query).toHaveBeenCalledWith(
+            'UPDATE providers SET current_state = $1 WHERE id = $2',
+            ['NORMAL', 'provider-123']
+        );
+    });
+
+    test('should not transition SYNC_ERROR providers', async () => {
+        pool.query.mockResolvedValueOnce({}); // UPDATE providers SET last_reset_at
+
+        await resetDaily('provider-123', 'SYNC_ERROR');
+
+        expect(pool.query).not.toHaveBeenCalledWith(
+            'UPDATE providers SET current_state = $1 WHERE id = $2',
+            expect.anything()
         );
     });
 });
